@@ -187,6 +187,234 @@ void iterate_precomputed_time(Simulation* simulation) {
   }
 }
 
+/// @brief Constructs the global residual and tangent for the current Newton iteration
+///
+void calc_rk(Simulation* simulation, std::string istr, eqType& eq, Vector<int>& incL, Vector<double>& res)
+{
+  using namespace consts;
+
+  // Unpack required data from the simulation object
+  auto& com_mod = simulation->com_mod;
+  auto& cm_mod = simulation->cm_mod;
+  auto& cep_mod = simulation->get_cep_mod();
+
+  auto& cEq = com_mod.cEq;
+  int tDof = com_mod.tDof;
+  int tnNo = com_mod.tnNo;
+  int nFacesLS = com_mod.nFacesLS;
+  double& dt = com_mod.dt;
+
+  auto& Ad = com_mod.Ad;      // Time derivative of displacement 
+  auto& Rd = com_mod.Rd;      // Residual of the displacement equation
+  auto& Kd = com_mod.Kd;      // LHS matrix for displacement equation
+  auto& An = com_mod.An;      // New time derivative of variables
+  auto& Yn = com_mod.Yn;      // New variables (velocity)
+  auto& Dn = com_mod.Dn;      // New integrated variables
+
+  if (com_mod.cplBC.coupled && cEq == 0) {
+    #ifdef debug_iterate_solution
+    dmsg << "Set coupled BCs " << std::endl;
+    #endif
+    set_bc::set_bc_cpl(com_mod, cm_mod);
+
+    set_bc::set_bc_dir(com_mod, An, Yn, Dn);
+  }
+
+  // Initiator step for Generalized α− Method (quantities at n+am, n+af). 
+  //
+  // Modifes
+  //   Ag((tDof, tnNo) - 
+  //   Yg((tDof, tnNo) - 
+  //   Dg((tDof, tnNo) - 
+  //
+  Array<double> Ag(tDof,tnNo); 
+  Array<double> Yg(tDof,tnNo); 
+  Array<double> Dg(tDof,tnNo); 
+  #ifdef debug_iterate_solution
+  dmsg << "Initiator step ..." << std::endl;
+  #endif
+  pic::pici(simulation, Ag, Yg, Dg);
+  Ag.write("Ag_pic"+ istr);
+  Yg.write("Yg_pic"+ istr);
+  Dg.write("Dg_pic"+ istr);
+  Yn.write("Yn_pic"+ istr);
+
+  if (Rd.size() != 0) {
+    Rd = 0.0;
+    Kd = 0.0;
+  }
+
+  // Allocate com_mod.R and com_mod.Val arrays.
+  //
+  // com_mod.R(dof,tnNo)
+  // com_mod.Val(dof*dof, com_mod.lhs.nnz)
+  //
+  // If Trilinos is used then allocate
+  //   com_mod.tls.W(dof,tnNo)
+  //   com_mod.tls.R(dof,tnNo)
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "Allocating the RHS and LHS"  << std::endl;
+  #endif
+
+  ls_ns::ls_alloc(com_mod, eq);
+  com_mod.Val.write("Val_alloc"+ istr);
+
+  // Compute body forces. If phys is shells or CMM (init), apply
+  // contribution from body forces (pressure) to residual
+  //
+  // Modifes: com_mod.Bf, Dg
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "Set body forces ..."  << std::endl;
+  #endif
+
+  bf::set_bf(com_mod, Dg);
+  com_mod.Val.write("Val_bf"+ istr);
+
+  // Assemble equations.
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "Assembling equation:  " << eq.sym;
+  #endif
+
+  for (int iM = 0; iM < com_mod.nMsh; iM++) {
+    eq_assem::global_eq_assem(com_mod, cep_mod, com_mod.msh[iM], Ag, Yg, Dg);
+  }
+  com_mod.R.write("R_as"+ istr);
+  com_mod.Val.write("Val_as"+ istr);
+
+  // Treatment of boundary conditions on faces
+  // Apply Neumman or Traction boundary conditions
+  //
+  // Modifies: com_mod.R
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "Apply Neumman or Traction BCs ... " << std::endl;
+  #endif
+
+  Yg.write("Yg_vor_neu"+ istr);
+  Dg.write("Dg_vor_neu"+ istr);
+
+  set_bc::set_bc_neu(com_mod, cm_mod, Yg, Dg);
+
+  com_mod.Val.write("Val_neu"+ istr);
+  com_mod.R.write("R_neu"+ istr);
+  Yg.write("Yg_neu"+ istr);
+  Dg.write("Dg_neu"+ istr);
+
+  // Apply CMM BC conditions
+  //
+  if (!com_mod.cmmInit) {
+    #ifdef debug_iterate_solution
+    dmsg << "Apply CMM BC conditions ... " << std::endl;
+    #endif
+    set_bc::set_bc_cmm(com_mod, cm_mod, Ag, Dg);
+  }
+
+  // Apply weakly applied Dirichlet BCs
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "Apply weakly applied Dirichlet BCs ... " << std::endl;
+  #endif
+
+  set_bc::set_bc_dir_w(com_mod, Yg, Dg);
+
+  // Apply contact model and add its contribution to residual
+  //
+  if (com_mod.iCntct) {
+    contact::construct_contact_pnlty(com_mod, cm_mod, Dg);
+
+#if 0
+    if (cTS <= 2050) {
+      Array<double>::write_enabled = true;
+      com_mod.R.write("R_"+ std::to_string(cTS));
+      //exit(0);
+    }
+#endif
+  }
+
+  // Synchronize R across processes. Note: that it is important
+  // to synchronize residual, R before treating immersed bodies as
+  // ib.R is already communicated across processes
+  //
+  if (!eq.assmTLS) {
+    #ifdef debug_iterate_solution
+    dmsg << "Synchronize R across processes ..." << std::endl;
+    #endif
+    all_fun::commu(com_mod, com_mod.R);
+  }
+
+  // Update residual in displacement equation for USTRUCT phys.
+  // Note that this step is done only first iteration. Residual
+  // will be 0 for subsequent iterations
+  //
+  // Modifies com_mod.Rd.
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "com_mod.sstEq: " << com_mod.sstEq;
+  #endif
+  if (com_mod.sstEq) {
+    ustruct::ustruct_r(com_mod, Yg);
+  }
+
+  // Set the residual of the continuity equation and its tangent matrix
+  // due to variation with pressure to 0 on all the edge nodes.
+  //
+  if (std::set<EquationType>{Equation_stokes, Equation_fluid, Equation_ustruct, Equation_FSI}.count(eq.phys) != 0) {
+    #ifdef debug_iterate_solution
+    dmsg << "thood_val_rc ..." << std::endl;
+    #endif
+    fs::thood_val_rc(com_mod);
+  }
+
+  // Treat Neumann boundaries that are not deforming
+  //
+  #ifdef debug_iterate_solution
+  dmsg << "set_bc_undef_neu ..." << std::endl;
+  #endif
+
+  set_bc::set_bc_undef_neu(com_mod);
+
+  // IB treatment: for explicit coupling, simply construct residual.
+  //
+  /* [NOTE] not implemented.
+  if (com_mod.ibFlag) {
+    if (com_mod.ib.cpld == ibCpld_I) {
+      //CALL IB_IMPLICIT(Ag, Yg, Dg)
+    }
+    // CALL IB_CONSTRUCT()
+  }
+  */
+
+  #ifdef debug_iterate_solution
+  dmsg << "Update res() and incL ..." << std::endl;
+  dmsg << "nFacesLS: " << nFacesLS;
+  #endif
+  incL = 0;
+  if (eq.phys == Equation_mesh) {
+    incL(nFacesLS-1) = 1;
+  }
+
+  if (com_mod.cmmInit) {
+    incL(nFacesLS-1) = 1;
+  }
+
+  for (int iBc = 0; iBc < eq.nBc; iBc++) {
+    int i = eq.bc[iBc].lsPtr;
+    if (i != -1) {
+      // Resistance term for coupled Neumann BC tangent contribution
+      res(i) = eq.gam * dt * eq.bc[iBc].r;
+      incL(i) = 1;
+    }
+  }
+
+}
+
+
+
+
+
 /// @brief Iterate the simulation in time.
 ///
 /// Reproduces the outer and inner loops in Fortan MAIN.f.
@@ -224,9 +452,6 @@ void iterate_solution(Simulation* simulation)
   dmsg << "cmmInit: " << com_mod.cmmInit;
   #endif
 
-  Array<double> Ag(tDof,tnNo); 
-  Array<double> Yg(tDof,tnNo); 
-  Array<double> Dg(tDof,tnNo); 
   Vector<double> res(nFacesLS); 
   Vector<int> incL(nFacesLS);
 
@@ -354,7 +579,6 @@ void iterate_solution(Simulation* simulation)
     int inner_count = 1;
     int reply;
     int iEqOld;
-
     while (true) { 
       #ifdef debug_iterate_solution
       dmsg << "---------- Inner Loop " + std::to_string(inner_count) << " -----------" << std::endl;
@@ -369,201 +593,12 @@ void iterate_solution(Simulation* simulation)
       iEqOld = cEq;
       auto& eq = com_mod.eq[cEq];
 
-      if (com_mod.cplBC.coupled && cEq == 0) {
-        #ifdef debug_iterate_solution
-        dmsg << "Set coupled BCs " << std::endl;
-        #endif
-        set_bc::set_bc_cpl(com_mod, cm_mod);
-
-        set_bc::set_bc_dir(com_mod, An, Yn, Dn);
-      }
-
-      // Initiator step for Generalized α− Method (quantities at n+am, n+af). 
+      // Construct the global residual and tangent for the current Newton iteration
       //
-      // Modifes
-      //   Ag((tDof, tnNo) - 
-      //   Yg((tDof, tnNo) - 
-      //   Dg((tDof, tnNo) - 
+      // Modifes: com_mod.R, com_mod.Val
       //
-      #ifdef debug_iterate_solution
-      dmsg << "Initiator step ..." << std::endl;
-      #endif
-      pic::pici(simulation, Ag, Yg, Dg);
-      Ag.write("Ag_pic"+ istr);
-      Yg.write("Yg_pic"+ istr);
-      Dg.write("Dg_pic"+ istr);
-      Yn.write("Yn_pic"+ istr);
-
-      if (Rd.size() != 0) {
-        Rd = 0.0;
-        Kd = 0.0;
-      }
-
-      // Allocate com_mod.R and com_mod.Val arrays.
-      //
-      // com_mod.R(dof,tnNo)
-      // com_mod.Val(dof*dof, com_mod.lhs.nnz)
-      //
-      // If Trilinos is used then allocate
-      //   com_mod.tls.W(dof,tnNo)
-      //   com_mod.tls.R(dof,tnNo)
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "Allocating the RHS and LHS"  << std::endl;
-      #endif
-
-      ls_ns::ls_alloc(com_mod, eq);
-      com_mod.Val.write("Val_alloc"+ istr);
-
-      // Compute body forces. If phys is shells or CMM (init), apply
-      // contribution from body forces (pressure) to residual
-      //
-      // Modifes: com_mod.Bf, Dg
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "Set body forces ..."  << std::endl;
-      #endif
-
-      bf::set_bf(com_mod, Dg);
-      com_mod.Val.write("Val_bf"+ istr);
-
-      // Assemble equations.
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "Assembling equation:  " << eq.sym;
-      #endif
-
-      for (int iM = 0; iM < com_mod.nMsh; iM++) {
-        eq_assem::global_eq_assem(com_mod, cep_mod, com_mod.msh[iM], Ag, Yg, Dg);
-      }
-      com_mod.R.write("R_as"+ istr);
-      com_mod.Val.write("Val_as"+ istr);
-
-      // Treatment of boundary conditions on faces
-      // Apply Neumman or Traction boundary conditions
-      //
-      // Modifies: com_mod.R
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "Apply Neumman or Traction BCs ... " << std::endl;
-      #endif
-
-      Yg.write("Yg_vor_neu"+ istr);
-      Dg.write("Dg_vor_neu"+ istr);
-
-      set_bc::set_bc_neu(com_mod, cm_mod, Yg, Dg);
-
-      com_mod.Val.write("Val_neu"+ istr);
-      com_mod.R.write("R_neu"+ istr);
-      Yg.write("Yg_neu"+ istr);
-      Dg.write("Dg_neu"+ istr);
-
-      // Apply CMM BC conditions
-      //
-      if (!com_mod.cmmInit) {
-        #ifdef debug_iterate_solution
-        dmsg << "Apply CMM BC conditions ... " << std::endl;
-        #endif
-        set_bc::set_bc_cmm(com_mod, cm_mod, Ag, Dg);
-      }
-
-      // Apply weakly applied Dirichlet BCs
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "Apply weakly applied Dirichlet BCs ... " << std::endl;
-      #endif
-
-      set_bc::set_bc_dir_w(com_mod, Yg, Dg);
-
-      // Apply contact model and add its contribution to residual
-      //
-      if (com_mod.iCntct) {
-        contact::construct_contact_pnlty(com_mod, cm_mod, Dg);
-
-#if 0
-        if (cTS <= 2050) {
-          Array<double>::write_enabled = true;
-          com_mod.R.write("R_"+ std::to_string(cTS));
-          //exit(0);
-        }
-#endif
-      }
-
-      // Synchronize R across processes. Note: that it is important
-      // to synchronize residual, R before treating immersed bodies as
-      // ib.R is already communicated across processes
-      //
-      if (!eq.assmTLS) {
-        #ifdef debug_iterate_solution
-        dmsg << "Synchronize R across processes ..." << std::endl;
-        #endif
-        all_fun::commu(com_mod, com_mod.R);
-      }
-
-      // Update residual in displacement equation for USTRUCT phys.
-      // Note that this step is done only first iteration. Residual
-      // will be 0 for subsequent iterations
-      //
-      // Modifies com_mod.Rd.
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "com_mod.sstEq: " << com_mod.sstEq;
-      #endif
-      if (com_mod.sstEq) {
-        ustruct::ustruct_r(com_mod, Yg);
-      }
-
-      // Set the residual of the continuity equation and its tangent matrix
-      // due to variation with pressure to 0 on all the edge nodes.
-      //
-      if (std::set<EquationType>{Equation_stokes, Equation_fluid, Equation_ustruct, Equation_FSI}.count(eq.phys) != 0) {
-        #ifdef debug_iterate_solution
-        dmsg << "thood_val_rc ..." << std::endl;
-        #endif
-        fs::thood_val_rc(com_mod);
-      }
-
-      // Treat Neumann boundaries that are not deforming
-      //
-      #ifdef debug_iterate_solution
-      dmsg << "set_bc_undef_neu ..." << std::endl;
-      #endif
-
-      set_bc::set_bc_undef_neu(com_mod);
-
-      // IB treatment: for explicit coupling, simply construct residual.
-      //
-      /* [NOTE] not implemented.
-      if (com_mod.ibFlag) {
-        if (com_mod.ib.cpld == ibCpld_I) {
-          //CALL IB_IMPLICIT(Ag, Yg, Dg)
-        }
-        // CALL IB_CONSTRUCT()
-      }
-      */
-
-      #ifdef debug_iterate_solution
-      dmsg << "Update res() and incL ..." << std::endl;
-      dmsg << "nFacesLS: " << nFacesLS;
-      #endif
-      incL = 0;
-      if (eq.phys == Equation_mesh) {
-        incL(nFacesLS-1) = 1;
-      }
-
-      if (com_mod.cmmInit) {
-        incL(nFacesLS-1) = 1;
-      }
-
-      for (int iBc = 0; iBc < eq.nBc; iBc++) {
-        int i = eq.bc[iBc].lsPtr;
-        if (i != -1) {
-          // Resistance term for coupled Neumann BC tangent contribution
-          res(i) = eq.gam * dt * eq.bc[iBc].r;
-          incL(i) = 1;
-        }
-      }
-
+      calc_rk(simulation, istr, eq, incL, res);
+      
       // Solve equation.
       //
       // Modifies: com_mod.R, com_mod.Val 
