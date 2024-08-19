@@ -189,7 +189,13 @@ void iterate_precomputed_time(Simulation* simulation) {
 
 /// @brief Constructs the global residual and tangent for the current Newton iteration
 ///
-void calc_rk(Simulation* simulation, std::string istr, eqType& eq, Vector<int>& incL, Vector<double>& res)
+/// @param simulation The simulation object
+/// @param istr A string to append to the output file names
+/// @param eq The current equation type
+/// @param incL A list of 0 or 1 values for each face passed to the LHS matrix. Used in the linear solver for special features, including for 0D coupling
+/// @param res Resistance term for 0D coupling contribution to the tangent
+/// @param construct_tangent Flag to indicate if the tangent should be constructed
+void construct_residual_and_tangent(Simulation* simulation, const std::string istr, eqType& eq, Vector<int>& incL, Vector<double>& res, const bool construct_tangent)
 {
   using namespace consts;
 
@@ -204,7 +210,6 @@ void calc_rk(Simulation* simulation, std::string istr, eqType& eq, Vector<int>& 
   int nFacesLS = com_mod.nFacesLS;
   double& dt = com_mod.dt;
 
-  auto& Ad = com_mod.Ad;      // Time derivative of displacement 
   auto& Rd = com_mod.Rd;      // Residual of the displacement equation
   auto& Kd = com_mod.Kd;      // LHS matrix for displacement equation
   auto& An = com_mod.An;      // New time derivative of variables
@@ -411,10 +416,6 @@ void calc_rk(Simulation* simulation, std::string istr, eqType& eq, Vector<int>& 
 
 }
 
-
-
-
-
 /// @brief Iterate the simulation in time.
 ///
 /// Reproduces the outer and inner loops in Fortan MAIN.f.
@@ -595,9 +596,9 @@ void iterate_solution(Simulation* simulation)
 
       // Construct the global residual and tangent for the current Newton iteration
       //
-      // Modifes: com_mod.R, com_mod.Val
+      // Modifes: com_mod.R, com_mod.Val, incL, res
       //
-      calc_rk(simulation, istr, eq, incL, res);
+      construct_residual_and_tangent(simulation, istr, eq, incL, res, true);
       
       // Solve equation.
       //
